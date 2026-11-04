@@ -1,0 +1,4 @@
+# BYK816-Chip-Direct-Mode-Rgb-
+Direct-mode per-key RGB for BYK816 keyboards: RAM-only firmware patch + OpenRGB driver. Tested on Rapoo V720.
+
+Vendor lighting software for many BYK816-based keyboards stores every frame in flash, which wears it out, so real-time effects (such as a music visualizer) are not practical. This project adds one small USB command to the keyboard’s firmware that writes key colours straight into the RAM the LED scan reads, so nothing is written to flash while it runs. A native OpenRGB driver makes the keyboard appear as a normal keyboard, so all OpenRGB effects and audio visualizers work. Verified on one keyboard, the Rapoo V720 (USB 24AE:4018); other BYK816 boards are untested and need the method re-applied. See docs/BYK816 Direct Mode Research Docs.md for the full write-up. Flashing firmware can brick your keyboard, so use it at your own risk.
