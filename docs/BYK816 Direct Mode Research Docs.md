@@ -4,7 +4,7 @@
 
 > **Status:** working end-to-end on one keyboard (Rapoo V720, USB `24AE:4018`). Everything marked *verified* was measured on that keyboard. Everything about *other* keyboards is a reasoned expectation, **not** tested. See [§15](#15-porting-to-other-byk816--sinowealth-keyboards).
 
-> **Scope:** this repository contains the **write-up only**. my own helper scripts, emulator, firmware images and OpenRGB driver sources are **not published**; the document describes the method and the results so they can be reproduced independently.
+> **Scope:** this repository contains this write-up, the helper scripts (`scripts/`, MIT) and the OpenRGB driver sources (`OpenRGB Controller/`, GPL-2.0-or-later). **No firmware images are published** (they contain the vendor's firmware): you dump your own keyboard and build the patched image from your dump with the scripts. **The scripts are a guideline, not exact or supported tools** — they are what was used on one keyboard, tidied up, and will need adjusting elsewhere. Byte-level patch details are in [FIRMWARE-PATCHES.md](FIRMWARE-PATCHES.md) and the command spec in [PROTOCOL.md](PROTOCOL.md).
 
 > **Risk notice:** flashing modified firmware can permanently brick a keyboard. Follow the safety process in [§12](#12-virtual-testing-and-safety-process-do-this-before-flashing) and keep a verified stock dump. You do this at your own risk. This information is provided as-is, without warranty or support.
 
@@ -21,7 +21,7 @@
 7. [How a frame reaches the LEDs](#7-how-a-frame-reaches-the-leds)
 8. [Firmware map](#8-firmware-map)
 9. [Dead ends (v1–v5) and what they taught](#9-dead-ends-v1v5-and-what-they-taught)
-10. [The final patch (v6/v7)](#10-the-final-patch-v6v7)
+10. [The final patch (v6/v7) and the reliability patches (v8/v9)](#10-the-final-patch-v6v7-and-the-reliability-patches-v8v9)
 11. [Measurements](#11-measurements)
 12. [Virtual testing and safety process](#12-virtual-testing-and-safety-process-do-this-before-flashing)
 13. [Flashing, verifying and recovering](#13-flashing-verifying-and-recovering)
@@ -39,8 +39,9 @@
 - We dumped the keyboard's 64 KiB flash, disassembled it, built a small 8051 emulator, and understood the receive path, the effect engine, the renderer and the LED-scan interrupt.
 - We added **one tiny new USB command** in unused flash space — `05 E0 <key> <R> <G> <B>` — that writes a key's colour **directly into the RAM buffers the LED scan reads**. It never touches flash. The patch is **314 bytes** (3-byte hook + 311-byte routine).
 - The patch was verified in an emulator against the firmware's own renderer for all 132 key positions before it was ever flashed.
-- A **native OpenRGB controller** (5 files) exposes the keyboard as a real keyboard with a 6×22 matrix and 104 named keys, so every OpenRGB effect and the Effects-plugin audio visualizer work unmodified.
-- Measured: ~3,400 tiny reports/s accepted, a full 104-key rainbow at **~28.6 fps**, no flicker, and no missed key presses once reports are capped at 800/s.
+- A **native OpenRGB controller** (5 files, in `OpenRGB Controller/`) exposes the keyboard as a real keyboard with a 6×22 matrix and 104 named keys, so every OpenRGB effect and the Effects-plugin audio visualizer work unmodified.
+- Measured: ~3,400 tiny reports/s accepted, a full 104-key rainbow at **~28.6 fps**, no flicker.
+- Heavy lighting traffic caused two keyboard side effects: **stuck keys** (a lost key-*release* report) and **missed key presses**. Two small follow-up patches fix them: **v8** (release guard) removed stuck keys completely; **v9** (guard + held-key resend) cut missed presses from ~13 per 800 characters to ~1 (a typo-level rate) even at 800 reports/s, and no misses were seen at 2000/s. The driver defaults to **1600 reports/s**.
 
 ```mermaid
 flowchart LR
@@ -65,7 +66,7 @@ flowchart LR
 | Settings storage | external I²C EEPROM (settings pages are sent with `06 03`) |
 | Host OS | Windows (Python + `hid` package, USBPcap/Wireshark for capture) |
 | Flasher | `sinowisp` (Sinowealth ISP flasher; its README lists the BYK 816) (`sinowisp write -d ciy-x77 --vendor_id 0x24ae --product_id 0x4018 <hex>`) — the flasher profile name `ciy-x77` was what worked for this chip |
-| Analysis | custom minimal 8051 disassembler (`d51.py`) and interpreter (`sim51.py`), plus emulator-based tests |
+| Analysis | custom minimal 8051 disassembler (`d51.py`) and interpreter (`sim51.py`), plus emulator-based tests (all in `scripts/`) |
 | RGB software | OpenRGB 1.1 (master at the time), Qt 6.8.3, Visual Studio 2022 Build Tools + Windows SDK |
 
 > The vendor software's own lighting and the keyboard's behaviour when unplugged were also observed (e.g. a frame sent through the vendor path survived a 5-second unplug — proof that it is stored in non-volatile memory).
@@ -180,7 +181,7 @@ payload offset  0x000 ─ 0x083  plane 0  (blue)    index = row*22 + col
                 0x108 ─ 0x18B  plane 2  (red)
 ```
 
-The display only shows the painting if the *settings* (type `03`) select the painted/software mode — in our case replaying a captured settings block (my own private helper `kb.py replay 11`, which re-sends a captured settings block) with the **M** key lit.
+The display only shows the painting if the *settings* (type `03`) select the painted/software mode — in our case by re-sending a settings block captured from the vendor software (not included in this repository: capture your own) with the **M** key lit.
 
 ### 6.2 The new command (the only protocol addition)
 
@@ -275,12 +276,12 @@ Other findings along the way:
 
 - Settings (`06 03`) go to an **external I²C EEPROM**; the display only shows the painting when settings select the painted mode.
 - After toggling hardware/software mode with the stale-tag design the keyboard showed an "unfinished canvas" — the staging buffer kept a leftover tag and the renderer drew settings bytes as colours. Irrelevant once the tag design was dropped.
-- Sending reports too fast makes the keyboard **miss key presses (~2 in 10)** because the main loop is busy; capping at 800 reports/s fixed it (verified by typing tests).
+- Sending reports too fast makes the keyboard **miss key presses** and later **leave keys stuck**. An early cap of 800 reports/s reduced this but did not remove it; the real fixes are v8/v9 ([§10.6](#106-reliability-stuck-keys-and-missed-presses-v8-v9)).
 - A flasher run once hung silently before enumerating; a Windows restart fixed it. Always replug the keyboard (≥ 5 s) after flashing — the flasher does not reboot it.
 
 ---
 
-## 10. The final patch (v6/v7)
+## 10. The final patch (v6/v7) and the reliability patches (v8/v9)
 
 ### 10.1 Design
 
@@ -519,15 +520,49 @@ Bytes changed relative to stock firmware: **314** in both v6 and v7 (3 at `0x535
 
 ### 10.5 Versions and hashes (firmware-only Intel HEX, 16-byte records, CRLF)
 
-The images themselves are not distributed (they contain the vendor firmware); the hashes are given so that an independent reproduction can be compared against my own.
+The images themselves are not distributed (they contain the vendor firmware); the hashes are given so that an independent reproduction (`scripts/build_v7.py` … `build_v9.py` run on your own dump of the same firmware revision) can be compared against the author's. Identical hashes require an identical stock dump (MD5 above).
 
 | File | SHA-256 |
 |---|---|
 | `v720_tiny6_fw.hex` | `67d1be6b30361ae24ee167ff8223e4ec3519c35f697b9199cc58da05fd1645b6` |
 | `v720_tiny7_fw.hex` | `88c99b84f75eb9a2882c7e8ac8d5948bc8bbcb9a1a7bdbdd9deafb7957fd9ac3` |
+| `v720_tiny8_fw.hex` | `d8f7cad56a002c5f188184a38afcb33eb39426b73d7e1a3fab86af7cfc55e93e` |
+| `v720_tiny9_fw.hex` | `a8685808b89ea5a351411a7309408f0d9fb1f1e77436d7922f85bab05c937f41` |
 | stock dump (64 KiB binary, MD5) | `5bdf8220d1c3b068b3d265106d337ec2` (two reads matched) |
 
 > These images are specific to **this** keyboard's firmware revision. Do **not** flash them on another model.
+
+### 10.6 Reliability: stuck keys and missed presses (v8, v9)
+
+After v7 the lighting worked, but with OpenRGB streaming at several hundred reports per second two keyboard faults appeared. Both were traced to the keyboard's own key-report path, not to the LEDs.
+
+**How key reports leave the keyboard (firmware map, all addresses stock):**
+
+- The only interrupt (`0x03 → 0x4215`) does the LED scan *and* the key-matrix scan. It reads port 0 per column into IRAM `0x92 + col` (22 columns, idle `0xFF`), restarts a debounce counter (IRAM `0xB6`) on any column change and, once the debounce count is reached, sets flag `24h.0`.
+- The main loop (`0x5C16`) calls the key processor (`0x5DD3`) when that flag is set. It compares the new matrix against the old one and builds the reports: the 8-byte boot keyboard report (IRAM `0x6C–0x73`, pending flag `23h.0`), and the NKRO bitmap (IRAM `0x7E–0x8D`, report ID 4, pending flag `27h.6`).
+- Reports are sent by `0x8DAF` (8-byte keyboard, busy bit SFR `0xAA.2`) and `0x7ADD` (endpoint 2: system / consumer / NKRO / mouse, busy bit `0xAB.2`). **A report is only transmitted once**, when its pending flag is set; there is no periodic refresh. USB control transfers (our feature reports) spin-wait in the same main loop (`0xA25F` from `0x53E1` / `0x546F`).
+
+**Stuck keys = a lost key-release.** If the single "all keys up" report is lost or overwritten while the main loop is busy with lighting reports, the host never learns that the key was released and repeats it forever.
+
+**v8 – release guard.** Right before each call of the 8-byte sender (call site `0x5D9D`, redirected to a 52-byte routine at `0xA640`): if no key is down (all 22 matrix bytes `0xFF`), roughly every 160 ms and nothing is pending, zero both report buffers and set both pending flags, so an "all up" report is re-sent. Confirmed on hardware: **stuck keys completely gone.**
+
+**Missed presses.** The same reasoning suggests a *press* report can also be lost. Typing tests (~800 characters each, `typetest`-style script, not published) on the same keyboard:
+
+| Firmware / lighting | Rate | Missed | Notes |
+|---|---|---|---|
+| v8, static colour (no streaming) | – | 1 | baseline (typo-level) |
+| v8, rainbow from OpenRGB | 800/s | 13 | mostly non-letter keys: space, backspace, ctrl, tab |
+| v8, rainbow from OpenRGB | 50/s | 3 | misses scale with report rate |
+| **v9, rainbow from OpenRGB** | **800/s** | **1** (space: 0 of 129) | best result; the one miss is likely a typo |
+| v9, rainbow from OpenRGB | 2000/s | 0 | works might miss a few keys |
+
+"Extra" characters stayed at 8–10 in every run (a baseline of the test, not a fault).
+
+**v9 – guard with held-key resend.** Same hook as v8 (73-byte routine at `0xA640`). Additionally, while a key is held, about every 20 ms (when the 10 ms counter's bit 0 is clear and the 1 ms counter is `< 2` and nothing is pending), the *current* report is marked pending again **without touching the buffers**, so a lost press gets more chances to arrive. When no key is down the v8 behaviour is kept. It clobbers only `R0`, `R7`, `A`, carry, and uses 2 extra stack bytes; it ends with `LJMP 0x8DAF`. Full listing in [FIRMWARE-PATCHES.md](FIRMWARE-PATCHES.md).
+
+**What is *not* proven.** The exact mechanism of the missed presses is a theory (a report lost in transit while the main loop sits in USB waits). The evidence is: no misses with static lighting, misses growing with report rate, and the v9 resend removing them. v7 had the same missed-press behaviour, so the guard itself is not the cause.
+
+**Design preference.** A watcher in the controller (pausing effects while typing) was tried first and rejected: it froze effects. A firmware-side fix keeps the controller simple.
 
 ---
 
@@ -538,9 +573,10 @@ The images themselves are not distributed (they contain the vendor firmware); th
 | 6-byte sync reports, unpaced | **3,395 accepted/s**, display clean |
 | Full-size 1032-byte report | ~13 ms each; disturbs the scan (moving column of lit keys) |
 | Full 104-key rainbow via `05 E0` (Python, unpaced) | 229 frames, 23,816 reports in 8 s → **28.6 fps** |
-| Typing while streaming unpaced | ~2/10 key presses missed |
-| Typing while streaming at ≤ 800 reports/s | no missed keys observed |
-| OpenRGB effects + audio visualizer (native driver) | smooth, no flicker, no missed keys |
+| Typing while streaming unpaced (v7) | ~2/10 key presses missed |
+| Typing while streaming at 800/s (v7) | fewer, but still occasional missed presses and stuck keys |
+| v8 / v9 typing tests | see the table in [§10.6](#106-reliability-stuck-keys-and-missed-presses-v8-v9) |
+| OpenRGB effects + audio visualizer (native driver, v9) | smooth, no flicker; rainbow usable at medium–medium-high speed (very high speed is limited by the report rate) |
 | Brightness v6 | visibly below hardware mode (software brightness step applied) |
 | Brightness v7 | clearly brighter than v6 (user-confirmed) |
 
@@ -552,7 +588,7 @@ The goal: **prove in software, before touching the hardware, that the patched im
 
 ### 12.1 Tools
 
-*(These tools are my own own and are not published; any equivalent will do.)*
+*(These tools are in `scripts/` — a guideline, not exact tools; any equivalent 8051 emulator will do.)*
 
 - A minimal **8051 interpreter** (`sim51.py`, ~500 lines of Python): instruction-accurate for the opcodes the firmware uses, with `iram` (256 bytes), `sfr`, `xram` (bytearray), `code` image, `push`, `run(until_pcs, limit)`. Any accurate 8051 core works; the key is that it can **run real code from a dump** and **let you set RAM/SFR state**.
 - A **disassembler/walker** (`d51.py`) to read the dump and double-check hooks.
@@ -576,7 +612,7 @@ flowchart TD
 Ground truth is **the firmware's own renderer** running in the emulator on the *stock* image: put a colour for one key in the painting page, run the renderer `0x24CF`, and read the LED arrays; then run the *patched* image's hook with the new report and compare **every byte of both LED arrays and the live buffer**.
 
 ```python
-# trimmed from test_patch6.py
+# trimmed from scripts/test_v7.py (the published version expects v7's raw colour instead of the brightness-scaled v6 value)
 from sim51 import CPU
 stock   = open("dump/v720_full.bin", "rb").read()
 patched = open("p7.bin", "rb").read()
@@ -609,13 +645,23 @@ for b7 in (1, 2, 4):
         assert got == expect and all(p.xram[a] == s.xram[a] for a in got)
 ```
 
-Recorded result for v6: **all 132 indexes × 3 brightness steps matched the stock renderer**, the only other RAM touched was the 8-byte scratch area, the acknowledgement state (`IRAM 46h = 0`, `PC = 0x5480`) was correct, and six non-matching reports behaved identically to stock. For v7 (no scaling) the values pass through unchanged at all five brightness steps.
+Recorded result for v6 (the published `test_v7.py` is the v7 variant): **all 132 indexes × 3 brightness steps matched the stock renderer**, the only other RAM touched was the 8-byte scratch area, the acknowledgement state (`IRAM 46h = 0`, `PC = 0x5480`) was correct, and six non-matching reports behaved identically to stock. For v7 (no scaling) the values pass through unchanged at all five brightness steps.
 
 > **Pitfall we hit:** the baseline must be rendered *per key and per brightness step* — the stock renderer fills non-painted positions with a brightness-dependent constant (e.g. 51 = 255 × 2/10 at step 1), which otherwise looks like extra writes.
 
+### 12.3b Tests for v8 / v9 (`scripts/test_v8.py`, `test_v9.py`)
+
+- only the call site (2 bytes) and the guard differ from v7; the boot area is identical;
+- thousands of random machine states: running the patched firmware equals running the *original* v7 from the state the guard is specified to produce (the emulator's scratch registers `R0`, `R7`, `A`, carry and stack bytes above SP are masked, since the guard is allowed to clobber them);
+- a held key: the current report reaches USB RAM unchanged on both keyboard endpoints;
+- busy endpoint: the report stays pending for a later retry;
+- stack use grows by at most 2 bytes.
+
+Pitfall: early test failures were the test's fault (scratch registers, a wrong SFR comparison, missing pending flags in the busy test), not the patch's. Also, flow analysis misses some code (e.g. `0x53E1`, `0x5404`), so completeness claims (“nothing else calls X”) should use raw byte searches.
+
 ### 12.4 What the emulator does **not** prove
 
-- Real-time behaviour (USB timing, interaction with the LED scan ISR). We test that empirically on hardware with a recoverable image.
+- Real-time behaviour (USB timing, interaction with the LED scan ISR, lost reports). v8/v9 exist precisely because of such effects; they were only found and judged on hardware with a recoverable image.
 - Peripheral side effects of SFR accesses outside what we model.
 - That scratch XRAM `0x0130–0x0135` is never used by *another* firmware path at runtime (static analysis says unused; a conservative reviewer can grep the disassembly for `0130`–`0135` references, or relocate the scratch).
 - Behaviour under a different firmware revision.
@@ -639,20 +685,20 @@ Because of this the process also relies on **recoverability** (§13): the boot l
 
 ```text
 # 1. verify the file (PowerShell)
-(Get-FileHash .\v720_tiny7_fw.hex -Algorithm SHA256).Hash
+(Get-FileHash .\v720_tiny9_fw.hex -Algorithm SHA256).Hash
 
 # 2. flash (use the full path of sinowisp.exe)
-& "C:\path\to\sinowisp.exe" write -d ciy-x77 --vendor_id 0x24ae --product_id 0x4018 ".\v720_tiny7_fw.hex"
+& "C:\path\to\sinowisp.exe" write -d ciy-x77 --vendor_id 0x24ae --product_id 0x4018 ".\v720_tiny9_fw.hex"
 
 # 3. unplug the keyboard, wait 5 s, plug it back in (the flasher does not reboot it)
 
 # 4. test: press the M (software) key so it lights, then
-python kb.py replay 11            # selects the painted/software mode (settings block)
-python rt4.py static 255 255 255  # new command, all keys
+# select the painted/software mode (re-send a settings block you captured from the vendor software)
+python rt4.py static 255 255 255  # new command, all keys (scripts/rt4.py)
 python rt4.py rainbow 8           # throughput test
 ```
 
-`kb.py` and `rt4.py` are my own small private helper scripts (not published): `kb.py` finds the HID paths and re-sends a captured settings block; `rt4.py` sends `05 E0 <idx> <R> <G> <B>` for each key.
+`scripts/kb.py` finds the HID paths and `scripts/rt4.py` sends `05 E0 <idx> <R> <G> <B>` for each key. Build your image with `scripts/build_v9.py <your dump> v9.hex`, and keep v7/v8/stock hex files for recovery (flash the stock hex the same way to go back). **Never flash without a verified stock backup.**
 
 **Recovery:** flash the stock firmware-only hex the same way. If the keyboard does not enumerate normally, the ISP boot loader (untouched) is still there, so the flasher should still be able to talk to it (not tested here: we never needed a boot-loader recovery). If the flasher hangs silently before it lists devices, close it, restart Windows and retry.
 
@@ -664,11 +710,11 @@ python rt4.py rainbow 8           # throughput test
 
 Why native rather than a bridge: an earlier intermediate solution (an E1.31/sACN receiver in Python forwarding to the keyboard) worked, but OpenRGB treats E1.31 devices as LED strips (`DEVICE_TYPE_LEDSTRIP`) and builds a matrix map only at creation from saved config, so 2D effects and keyboard-only plugins did not work, and a separate process had to be kept running. A native controller registers a real `DEVICE_TYPE_KEYBOARD` with a proper matrix.
 
-### 14.1 Structure of the driver (sources not published)
+### 14.1 Structure of the driver (sources in `OpenRGB Controller/`)
 
 ```
-OpenRGB/Controllers/RapooV720Controller/     (a new folder; OpenRGB's project file picks up Controllers/*.cpp/.h by wildcard)
-├── RapooV720Controller.h/.cpp        HID access, report builder, pacing (≤ 800 reports/s)
+OpenRGB/Controllers/RapooV720Controller/     (copy of `OpenRGB Controller/RapooV720Controller`; a new folder; OpenRGB's project file picks up Controllers/*.cpp/.h by wildcard)
+├── RapooV720Controller.h/.cpp        HID access, report builder, pacing (default 1600 reports/s)
 ├── RGBController_RapooV720.h/.cpp    keyboard definition: 104 LEDs, 6×22 matrix, Direct mode
 └── RapooV720ControllerDetect.cpp     HID detector + collection probing
 ```
@@ -679,15 +725,18 @@ flowchart LR
     DET -- "try 05 83 sync on each collection" --> OK{accepted?}
     OK -- yes --> CTRL[RapooV720Controller + RGBController_RapooV720]
     OK -- no --> CLOSE[hid_close, ignore]
-    CTRL --> UPD[DeviceUpdateLEDs:<br/>send only changed keys<br/>05 E0 idx R G B]
+    CTRL --> UPD[DeviceUpdateLEDs records colours,<br/>sender thread sends changed keys<br/>05 E0 idx R G B]
 ```
 
 Design points:
 
 - **Detection** matches interface 1 / usage page `0xFF00` / usage 1 (three collections on this keyboard) and *keeps the one whose `hid_send_feature_report` of the sync report succeeds* — that is the collection that owns report 5.
 - **Direct mode only** (`MODE_FLAG_HAS_PER_LED_COLOR`): all effects come from OpenRGB itself. Nothing is saved to the keyboard.
-- **Pacing:** a steady-clock limiter spaces reports at ≥ 1.25 ms (800/s) to avoid starving the keyboard's key scan.
+- **Sender thread:** `DeviceUpdateLEDs` only records the wanted colours (rounded to steps of 4, which makes smooth gradients cheaper to transmit) and wakes a sender thread. The thread builds a to-do list of keys that differ from what the keyboard shows (largest change first, aged entries boosted), always finishes the whole pass, then takes the newest colours. Frames that arrive meanwhile are skipped, so the last colour always wins and effects stay coherent.
+- **Pacing:** reports are limited to a rate (default **1600/s**; env var `RAPOO_V720_MAX_RATE`, 50–2000). `SetKey()` waits for its turn, so it must only be called from the sender thread. Calling it from OpenRGB's update path made OpenRGB and its effect preview lag.
 - **Change filtering:** a per-LED "last sent" cache; unchanged keys are not re-sent.
+- **Macro pitfall:** OpenRGB's `ToRGBColor(r, g, b)` has no parentheses around its arguments; passing an expression like `x & 0xFC` zeroed green and blue (symptom: only red shown). Compute the channels in variables first.
+- **Rate vs firmware:** v9 tolerated 1600–2000/s in typing tests; on v7/v8 stay at about 400–800/s.
 - **Matrix:** 6 rows × 22 columns, entry = position in the LED list; `0xFFFFFFFF` = no key. Wide keys (Enter, Right Shift, Backspace, numpad +/Enter, 0) occupy a single cell, so they look offset in the grid — cosmetic only.
 - **Key names** use OpenRGB's standard `KEY_EN_*` constants so keyboard effects and per-key plugins recognise them.
 
@@ -712,7 +761,7 @@ Design points:
 | Idea: RAM-only per-key command in unused flash | yes | cave location, hook point |
 | Flasher & recovery flow (`sinowisp`, firmware-only hex, boot loader untouched) | yes, if the chip is supported | device profile (`-d ...`), PID/VID |
 | Report framing (report 5 six bytes, report 6 1032 bytes) | probably | confirm with USB capture |
-| Pacing lesson (≤ ~800 reports/s; small reports only) | probably | measure |
+| Pacing lesson (small reports only; rate limit; guard v8/v9 idea) | probably | measure; check stuck/missed keys with a typing test |
 | OpenRGB driver structure, detector, pacing, change-filter | yes | VID/PID, collection, key table, matrix size |
 | Emulator test method | yes | the reference renderer addresses |
 
@@ -724,7 +773,7 @@ Design points:
 4. **Find the LED arrays** (data the ISR copies to PWM registers) and confirm in the emulator by running the stock renderer with a known colour on one key and diffing XRAM (that is how the array stride `0x12`/`3` and the B/G/R channel order were found here).
 5. **Find the 6-byte report handler's fall-through** (a place where an unknown 6-byte report is copied) and an **all-zero** flash region large enough for the routine; decide scratch bytes in XRAM that nothing uses.
 6. **Write the builder** with asserts (see §12) and an emulator reference test **before** any flash.
-7. **Flash firmware-only**, replug, test with a static colour, then throughput; **always** run a typing test while streaming and set the report-rate cap accordingly.
+7. **Flash firmware-only**, replug, test with a static colour, then throughput; **always** run a typing test while streaming (static vs streaming comparison) and set the report-rate cap accordingly; consider the v8/v9 guard if keys stick or are missed.
 8. **Create/adjust the OpenRGB driver:** VID/PID, probe collection, key list (index → name), matrix dimensions.
 
 ### 15.3 Things that may differ on other boards
@@ -742,10 +791,11 @@ Design points:
 
 - **Single-device verification:** only the Rapoo V720 (one unit) was tested. The "same for all BYK816 keyboards" expectation is unverified.
 - **Software mode required:** the keyboard must be in the painted/software mode (M key lit after a settings replay) for the direct colours to be visible. Automating this on connect (sending the settings block from the driver) is not done yet.
-- **Brightness** in direct mode is not controlled by the keyboard (v7 bypasses its scaling); control it in OpenRGB.
+- **Brightness** in direct mode is not controlled by the keyboard (v7 and later bypass its scaling); control it in OpenRGB.
 - **Scratch RAM** `0x0130–0x0135` was chosen by static analysis; it is untested against every firmware path (recommend a reference search or relocating it).
 - **Four extra keys** above the numpad (Fn, Mute, Win Lock, M) have no addressable per-key LED in our index map.
-- **Rate cap** (800/s) was chosen empirically; the true limit depends on how long the main loop spends in USB handling.
+- **Rate cap:** 1600/s (v9) was chosen empirically from short typing tests (800/s long-run result: 1 miss in 807 characters; 2000/s: no misses in a shorter test). The true limit depends on how long the main loop spends in USB handling. Very fast rainbow speeds are limited by the report rate (~16–28 full frames/s).
+- **Missed-press mechanism** is a theory; v9 is an empirical fix ([§10.6](#106-reliability-stuck-keys-and-missed-presses-v8-v9)). No readback path from the keyboard was found, so a driver cannot query firmware version or state.
 - **Key naming** assumes an ANSI layout; the two keys right of Space (`RWin`/`Menu` at indexes 119/120) were assigned by convention.
 - **Flash endurance numbers** in §3 are typical class values, not measurements of this chip.
 - The effect machine and the `0x24`–`0x28` effect ids are only partly mapped.
@@ -754,11 +804,12 @@ Design points:
 
 ## 17. Legal and ethics
 
-- Done on my own own device for interoperability and repair.
-- This document describes methods and results only. It does **not** include vendor firmware dumps or full firmware images, and readers should dump their own keyboard.
+- Done on the author's own device for interoperability and repair.
+- This repository contains documentation, helper scripts and driver sources only. It does **not** include vendor firmware dumps or firmware images (neither stock nor patched); readers must dump their own keyboard and build the patched image themselves.
+- Licences: `OpenRGB Controller/` is GPL-2.0-or-later (same as OpenRGB), `scripts/` is MIT; this documentation carries no licence file.
 - Flashing modified firmware can permanently brick hardware and may void the warranty. Nothing here is a recommendation to do so; everything is provided as-is, without warranty or support.
 - Names and trademarks (Rapoo, Sinowealth, OpenRGB, etc.) belong to their owners; no affiliation is implied.
-- Im is not a lawyer; this is not legal advice.
+- The author is not a lawyer; this is not legal advice.
 
 ---
 
@@ -798,6 +849,8 @@ Bold = key label, subscript = key index sent in `05 E0 <idx> …`; `·` = no add
 6. v7: brightness bypass; rate cap fixes missed key presses.
 7. E1.31 bridge as an intermediate OpenRGB path; replaced by a native keyboard driver.
 8. Final: OEM-quality effects and visualizer in OpenRGB.
+9. Driver reworked (sender thread, change-priority, macro fix) after lag, stale keys and red-only output.
+10. v8 release guard: stuck keys gone. v9 held-key resend: missed presses ~13 → ~1 per 800 characters. Default rate raised to 1600/s.
 
 ### D. Glossary
 
@@ -812,4 +865,5 @@ Bold = key label, subscript = key index sent in `05 E0 <idx> …`; `·` = no add
 
 - OpenRGB project (controller framework, effects plugin, visual map plugin).
 - The authors of the `sinowisp` flasher and the community notes on Sinowealth-family keyboards.
-- Assisted by Claude (Anthropic) Sonnet 5.5 LLM.
+- Claude (Anthropic) Sonnet 5.5 LLM.
+
